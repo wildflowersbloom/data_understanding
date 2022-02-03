@@ -1,0 +1,256 @@
+---
+title: "Data Exploration in R"
+author: "Barbara Casillas"
+date: "1/27/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Messy data into time-analytical insight
+
+This R Markdown document chronicles a mission to take quite messy sports data provided by Viviene Roussez to implement and understand time series analysis.
+
+```{r libraries, warning=FALSE,message=FALSE}
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(plotly)
+library(GGally) 
+library(ggpubr)
+library(zoo)
+library(forecast)
+library(seasonal)
+```
+We have a dataset with sport activities, already nicely arranged into a dataset, with one row per event, along with time of event and a handful of metrics recorded by a Garmin device over ten years. I will focus on outdoor cycling events and a few relevant metrics.
+```{r data}
+data<-readRDS(file = "./data/dat_clean.rds")%>% #data_clean from ZZ2-data_preparation.R
+              filter(activityType%in%c("cycling"))%>%droplevels()%>%
+              select(activityType,#what
+                     start_time, #when
+                     duration, distance, avgSpeed, maxSpeed,#how long, far,fast
+                     elevationGain, #elevation change (gain~loss)
+                     avgHr,#heart rate
+                     avgPower,max20MinPower,#power
+                     avgBikeCadence,#cadence
+                     calories) #energy
+```
+
+Inspecting the summary statistics of the data set already indicates there is some anomalous data, possibly measurment errors, that I will exclude. 
+
+```{r clean}
+data<-filter(data,duration>10,avgSpeed>5,!(maxSpeed>120),elevationGain<3000)
+```
+
+In time series analysis there shouldn't be duplicated events. I found one, "2016-11-01 14:52:50"
+```{r clean again}
+data<-data[-1371,]
+```
+
+A correlogram of all variables already gives quite an insight. As expected, cadence is moderately negatively correlated with elevation gain. There are considerable positive correlations between distance, duration and calories, and between power and speed variables.
+```{r exploration}
+library(corrgram)
+corrgram(select(data,-c(activityType)),
+         order=T, lower.panel=panel.shade,
+        diag.panel=panel.density,
+         upper.panel=NULL)
+```
+<br/>
+Besides the correlations, the distributions are bimodal, possibly reflecting two types of cycling, e.g. with a slower mountain bike and with faster road bike.
+```{r pairs}
+ggpairs(select(data,duration,distance,avgSpeed, maxSpeed))+theme_light()
+```
+<br/>
+So to start a time series analysis, considering that these variables are time series, i.e. metrics of Vivienne's cylcing performance were gathered over time, we can do some visual exploration first, plotting the variables with respect to time. We can parse the time variable 'start_time' with 'lubridate'.
+
+```{r}
+data<-data%>% mutate(year=year(data$start_time),
+                    month=month(data$start_time),
+                    weekday=wday(data$start_time,week_start = 1),
+                    hour=hour(data$start_time))
+
+```
+<br/>
+Most cycling events start at 7-8am or 5-6pm, they are perhaps commute to and from work.
+```{r}
+ggplot(data,aes(x=hour))+geom_bar()+theme_minimal()+ylab("number of rides")
+```
+<br/>
+And the least number of rides happen during the weekend Fri-Sun (left), although long rides (above 2 hours), happen mostly during the weekend (right).
+```{r}
+a<-ggplot(data,aes(x=weekday))+geom_bar()+theme_minimal()+ylab("number of rides")
+b<-ggplot(filter(data,duration>120),aes(x=weekday))+geom_bar()+theme_minimal()+ylab("number of long rides")
+ggarrange(a,b,ncol = 2,widths = c(1,1))
+```
+<br/>
+With respect to monthly patterns, it is clear that less and shorter rides happen during the winter months
+```{r}
+c<-ggplot(data,aes(x=month))+geom_bar()+theme_minimal()+ylab("number of rides")
+d<-ggplot(data,aes(duration,x=month))+geom_point()+theme_minimal()+ylab("duration of rides (min)")
+ggarrange(c,d,ncol = 2,widths = c(1,1))
+```
+
+### Time series analysis
+
+Knowing already that there are hourly, weekly, and monthly patterns, we remove some complexity from the data. We can aggregate the data, to have a single value per month. Months with no data, can be imputed with an interpolation. 
+
+```{r, message=FALSE, warning=FALSE}
+mdata <- data %>% mutate(time =  as.Date(cut(start_time, "month")))%>%
+  group_by(time) %>%
+  summarise(mduration = sum(duration,na.rm=T), #total duration of all rides in a month
+            endurance = max(duration,na.rm=T), #new! maximum duration of a ride in a month
+         distance = sum(distance,na.rm=T), #total distance in a month
+         avgSpeed = mean(avgSpeed,na.rm=T),#average over ride and again over month
+         maxSpeed = max(maxSpeed,na.rm=T), #max over month 
+         avgPower =mean(avgSpeed,na.rm=T)) #average over ride and again over month
+
+mdata<-mdata %>% # NA rows in missing months
+  tidyr::complete(time = seq.Date(min(time), max(time), by = "month"))
+library(imputeTS)
+mdata<-na_interpolation(mdata)  #impute NA rows with interpolation
+```
+
+Some variables like, endurance (max duration in a month) show marked seasonality. 
+```{r}
+ggplot(mdata,aes(endurance,x=time))+geom_line()+geom_point()+theme_minimal()
+```
+<br/>
+We can create a time series object in many ways. The 'zoo' and 'ts' libraries are the most popular.
+```{r}
+ts_endurance <- zoo(mdata$endurance, mdata$time) 
+plot(ts_endurance)
+```
+<br/>
+We can decompose a time series into its components: trend, seasonal and random component.
+```{r}
+ts_endurance = ts(mdata$endurance, start = c(2012,1), frequency = 12)
+components.ts = decompose(ts_endurance) #to see clear seasonal component #endurance, is max duration
+plot(components.ts)
+```
+
+
+<br/>
+We can de-trend a timeseries.
+```{r,message=FALSE, warning=FALSE}
+ts_maxSpeed = ts(mdata$maxSpeed, start = c(2012,1), frequency = 12)
+m <- lm(coredata(ts_maxSpeed) ~ index(ts_maxSpeed))
+e=autoplot(ts_maxSpeed)+theme_minimal()+geom_smooth(method="lm",se=F)+ylab("max speed")
+detr <- zoo(resid(m), index(ts_maxSpeed))
+f=autoplot(detr)+theme_minimal()+geom_smooth(method="lm",se=F)+ylab("detrended max speed variable")
+ggarrange(e,f,ncol = 2,widths = c(1,1))
+```
+
+
+<br/>
+There are other packages (e.g. 'seasonal') to decompose time series,(with different tecniques)
+```{r,message=FALSE, warning=FALSE}
+ts_maxSpeed %>% seas(x11="") -> fit
+autoplot(ts_maxSpeed, series="Data") +
+  autolayer(trendcycle(fit), series="Trend") +
+  autolayer(seasadj(fit), series="Seasonally Adjusted") +
+  xlab("Year") + ylab("New orders index") +
+  ggtitle(" Max cycling speed") +
+  scale_colour_manual(values=c("gray","blue","red"),
+                      breaks=c("Data","Seasonally Adjusted","Trend"))
+```
+
+The most popular R package to perform time series analysis to date is 'forecast'.
+With it we can easily visualize seasonal trends.
+```{r,message=FALSE, warning=FALSE}
+g<-ggseasonplot(ts_endurance, year.labels=TRUE, year.labels.left=TRUE) +
+  ylab("endurance") + ggtitle("Seasonal plot")+theme_minimal()
+h<-ggseasonplot(ts_endurance,polar=TRUE) +
+  ylab("endurance") +  ggtitle("Polar plot")+theme_minimal()
+ggarrange(g,h,ncol = 2,widths = c(1,1))
+```
+
+<br/>
+With the 'forecast' package, obviously, we can also make forecasts.
+```{r,message=FALSE, warning=FALSE}
+autoplot(ts_maxSpeed) +
+  autolayer(meanf(ts_maxSpeed, h=20),
+            series="Mean", PI=FALSE) +
+  autolayer(naive(ts_maxSpeed, h=20),
+            series="Naïve", PI=FALSE) +
+  autolayer(snaive(ts_maxSpeed, h=20),
+            series="Seasonal naïve", PI=FALSE) +
+  autolayer(rwf(ts_maxSpeed, drift=TRUE, h=20),
+            series="Drift", PI=FALSE) +
+  ggtitle("Forecasts for maximum speed") +
+  xlab("Year") + ylab("Max cycling speed") +
+  guides(colour=guide_legend(title="Forecast"))
+```
+<br/>
+Forecast function 'snaive' returns forecasts and prediction intervals from an ARIMA(0,0,0)(0,1,0)m model where m is the seasonal period (in this case 12).
+```{r,message=FALSE, warning=FALSE}
+fc<-snaive(ts_maxSpeed)
+autoplot(fc)+theme_minimal()
+```
+
+<br/>
+One can readily inspect the model and residuals, to try to understand if this is a good forecast.
+```{r}
+summary(fc)
+res <- residuals(fc)
+checkresiduals(res)
+```
+
+<br/>
+The large value of the ACF at 12, indicates a large auto-correlation of the values with lag=12, i.e. yearly seasonality.
+
+## ARIMA forecast
+ARIMA models are the most popular approach in forecasting. A good way to understand them is to first understand simpler models (i.e. AR and MA models). In a multiple regression model, we forecast the variable of interest using a linear combination of predictors. In an autoregression model (AR), we forecast the variable of interest using a linear combination of past values of the variable. A moving average model uses past forecast errors. Other pre-requisites to understand ARIMA models are having a good grasp what is 'stationarity' and what differencing does to a non-stationary time series. A good resource is https://otexts.com/fpp2/seasonal-arima.html
+
+
+<br/>
+'forecast' provides a function, 'auto.arima' for a quick start. This function combines unit root tests (to check stationarity), minimisation of the AICc and MLE to obtain an ARIMA model.
+
+```{r,message=FALSE, warning=FALSE}
+m=auto.arima(ts_maxSpeed)
+m
+```
+<br/>
+One way to test whether a time series is stationary (it's not) and what differencing does.
+```{r}
+Box.test(ts_maxSpeed, type="Ljung-Box")
+x<-ggAcf(ts_maxSpeed)
+Box.test(diff(ts_maxSpeed), type="Ljung-Box")
+y<-ggAcf(diff(ts_maxSpeed))
+ggarrange(x,y,ncol = 2,widths = c(1,1))
+```
+
+<br/>
+Another way to do the same:
+```{r}
+myts<-ts_endurance
+#differencing
+cbind("TS" =myts,
+      "Logs" = log(myts),
+      "Seasonally\n differenced logs" =
+        diff(log(myts),12),
+      "Doubly\n differenced logs" =
+        diff(diff(log(myts),12),1)) %>%
+  autoplot(facets=TRUE) +
+  xlab("Year") + ylab("") +
+  ggtitle("Endurance")
+```
+<br/>
+The output of 'auto.arima' included ARIMA (2,1,1).  In this case, auto.arima decided the best order was (2, 1, 1), which means that it differenced the data twice  (d = 2) before selecting a model with AR coefficients (p = 1) and zero MA coefficients (q = 1). It's AIC was 833. 
+```{r}
+m1<-auto.arima(ts_maxSpeed) #Arima, (2,1,1) AIC 833
+checkresiduals(m1)
+```
+Let's try another model adding the seasonal component. 
+checkresiduals(m2)
+```{r}
+m2 <- Arima(ts_maxSpeed, order=c(2,1,1), seasonal=c(0,1,1))#AIC 768
+checkresiduals(m2)
+m2%>% forecast(h=12) %>% autoplot()+theme_minimal()
+```
+
+Well, there's much more ot understand about time series, forecasting, and in particular ARIMAs, but this is a good enough start. :)
+
+
+
